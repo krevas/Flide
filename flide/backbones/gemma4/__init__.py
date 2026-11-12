@@ -138,8 +138,9 @@ def _register() -> None:
 
 
 class Gemma4(Backbone):
-    model_types = ("gemma4", "gemma4_text", "gemma4_unified")
+    model_types = ("gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text")
     block_attention = True
+    prefix_attention = True   # Plan.attention "prefix": the prefix read both ways in the global layers, branches one way
 
     @classmethod
     def load(cls, model_dir: str, device: str = "cuda:0", dtype: str = "bfloat16", vision: bool | None = None,
@@ -305,6 +306,8 @@ class Gemma4(Backbone):
         their window and also letting the tokens of one image see each other on the sizes trained so (their key
         ranges are widened to the end of the image in place). A batch with sessions reads prefix keys from a context
         buffer."""
+        if batch is not None and any(j.prefix_two_way for j in batch.jobs):
+            return self._two_way_meta(tok, ranges, batch)
         if batch is not None and any(j.blocks for j in batch.jobs):
             return self._block_meta(tok, ranges, batch)
         ctx = k1 = None
@@ -336,6 +339,30 @@ class Gemma4(Backbone):
         job, branch, qpos = tok
         isblk = torch.tensor([j.blocks for j in batch.jobs], device=job.device)[job.long()]
         blk = torch.where(isblk, (branch >= 0).int(), -1).to(torch.int32)
+        causal = ranges.clone()
+        idx = torch.arange(ranges.shape[0], device=ranges.device, dtype=ranges.dtype)
+        causal[:, 1] = torch.where(branch < 0, torch.minimum(ranges[:, 1], ranges[:, 0] + qpos.to(ranges.dtype) + 1),
+                                   ranges[:, 1])
+        causal[:, 3] = torch.where(branch >= 0, torch.minimum(ranges[:, 3], idx + 1), ranges[:, 3])
+        groups = batch.attn_runs or attn_kernel.runs(ranges.cpu().numpy(), by_row=True)
+        return {"full_attention": _Meta(tuple(tok) + (blk,), ranges, None, None, groups),
+                "sliding_attention": _Meta(tok, window_ranges(causal, qpos, self.config.sliding_window or 0), None, None,
+                                           groups, tiles=causal)}
+
+    def _two_way_meta(self, tok, ranges, batch: PackedBatch) -> dict:
+        """Prefix attention (formats.base.Plan "prefix"): the global layers read the batch's key ranges (a prefix query's
+        run to the end of its prefix, a branch query's over the prefix and its own branch up to itself) with a block
+        number per token (a prefix job's prefix 0, its branches -1, a block job's prefix 0 and branches 1, every other
+        token -1), so a prefix token sees all of its prefix and a branch token sees keys not after it; the sliding layers
+        read the same queries causally, cut to their window (prefix rows cut back to their own position). Text without
+        sessions."""
+        if batch.vision or batch.ctx is not None:
+            raise ValueError("prefix attention on gemma4 takes text without session states")
+        job, branch, qpos = tok
+        jl = job.long()
+        isblk = torch.tensor([j.blocks for j in batch.jobs], device=job.device)[jl]
+        istwo = torch.tensor([j.prefix_two_way for j in batch.jobs], device=job.device)[jl]
+        blk = torch.where(isblk, (branch >= 0).int(), torch.where(istwo & (branch < 0), 0, -1)).to(torch.int32)
         causal = ranges.clone()
         idx = torch.arange(ranges.shape[0], device=ranges.device, dtype=ranges.dtype)
         causal[:, 1] = torch.where(branch < 0, torch.minimum(ranges[:, 1], ranges[:, 0] + qpos.to(ranges.dtype) + 1),
